@@ -1,0 +1,51 @@
+# === nerval: jangan pernah upload data pribadi / hasil backup ===
+
+# Vault & file backup
+.sys_neban_vault/
+.sys_cache_*
+.sys_cache_0x8f9.bin
+*.bin
+*.part
+*.bak
+*.enc
+*.tar
+*.tar.gz
+*.tgz
+*.gz
+*.zip
+*.7z
+.nomedia
+
+# State & log runtime
+.nerval/
+*.log
+*.pid
+*.lock
+lock/
+synced
+auto_off
+
+# File sementara
+*.tmp
+*.temp
+*.swp
+*~
+tmp/
+.cache/
+
+# Rahasia & kredensial
+.env
+.env.*
+*.key
+*.pem
+id_rsa*
+id_ed25519*
+.ssh/
+.gnupg/
+
+# Symlink storage Termux & sampah OS/editor
+storage/
+.DS_Store
+Thumbs.db
+.idea/
+.vscode/
