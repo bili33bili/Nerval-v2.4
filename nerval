@@ -1,0 +1,1094 @@
+#!/data/data/com.termux/files/usr/bin/bash
+# nerval — Backup & lindungi $HOME Termux ke vault tersembunyi di /sdcard.
+# Multi-akun: tiap akun = username + password + vault sendiri.
+# Kripto: PBKDF2-HMAC-SHA256 -> AES-256-CBC.
+# Format vault: [16 byte salt][16 byte IV][ciphertext]  (tanpa header yang dikenali)
+
+set -u
+set -o pipefail
+
+NERVAL_VERSION="2.4.0"
+
+# ---------------------------------------------------------------------------
+# Validasi ketat: hanya boleh berjalan di dalam lingkungan Termux
+# ---------------------------------------------------------------------------
+case "${PREFIX:-}" in
+  *com.termux*) ;;
+  *)
+    printf '[nerval] Akses ditolak: tool ini hanya bisa dijalankan di dalam Termux.\n' >&2
+    exit 1
+    ;;
+esac
+if [ -z "${HOME:-}" ] || [ ! -d "$HOME" ]; then
+  printf '[nerval] Akses ditolak: $HOME tidak valid.\n' >&2
+  exit 1
+fi
+
+# ---------------------------------------------------------------------------
+# Konstanta
+# ---------------------------------------------------------------------------
+VAULT_DIR="/sdcard/.sys_neban_vault"
+STATE_DIR="$HOME/.nerval"
+PID_FILE="$STATE_DIR/watcher.pid"
+WATCH_ACCT_FILE="$STATE_DIR/watcher.acct"
+LAST_USER_FILE="$STATE_DIR/last_user"
+LOG_FILE="$STATE_DIR/nerval.log"
+LOCK_DIR="$STATE_DIR/lock"
+AUTO_OFF="$STATE_DIR/auto_off"     # penanda: auto-backup dimatikan user
+DEBOUNCE=10                        # detik tenang sebelum auto-backup berjalan
+MAX_WAIT=300                       # batas tunggu debounce bila perubahan terus-menerus
+KDF_ITER=200000                    # iterasi PBKDF2
+HDR_SKIP=33                        # tail -c +33 : lewati 16 byte salt + 16 byte IV
+DEFAULT_ACCT="utama"               # akun "utama" = file vault bawaan .sys_cache_0x8f9.bin
+MANIFEST_NAME=".nerval-manifest"   # daftar tools yang ikut tersimpan di dalam vault
+MANIFEST_AGE=0                     # umur maks. (detik) daftar tools sebelum dibuat ulang (watcher: 3600)
+SESSION_FILE="$STATE_DIR/session"  # sesi login (kunci turunan, chmod 600, TIDAK ikut backup)
+DEFAULT_TTL=0                     # menit; 0 = PERMANEN (sampai "nerval logout"). Bisa dibatasi: login --ttl MENIT
+BOOT_ID="$(tr -d '\n' < /proc/sys/kernel/random/boot_id 2>/dev/null)"
+SESSION_NOTE=""
+SELF="$(readlink -f "$0" 2>/dev/null || printf '%s' "$0")"
+
+# Diisi setelah login
+ACCT=""; ACCT_ID=""; VAULT_FILE=""; SYNC_MARK=""
+KEY=""; SALT_HEX=""; NEW_PW=""; REPLY_PW=""
+
+# ---------------------------------------------------------------------------
+# Tampilan terminal
+# ---------------------------------------------------------------------------
+if [ -t 1 ]; then
+  C_R=$'\033[31m'; C_G=$'\033[32m'; C_Y=$'\033[33m'; C_B=$'\033[36m'
+  C_D=$'\033[2m';  C_W=$'\033[1m';  C_0=$'\033[0m'
+else
+  C_R=""; C_G=""; C_Y=""; C_B=""; C_D=""; C_W=""; C_0=""
+fi
+ok()   { printf '%s✓%s %s\n' "$C_G" "$C_0" "$*"; }
+info() { printf '%s•%s %s\n' "$C_B" "$C_0" "$*"; }
+warn() { printf '%s!%s %s\n' "$C_Y" "$C_0" "$*" >&2; }
+err()  { printf '%s✗%s %s\n' "$C_R" "$C_0" "$*" >&2; }
+header() {
+  local pad=$(( 30 - 19 - ${#NERVAL_VERSION} ))
+  printf '%s╭──────────────────────────────╮%s\n' "$C_D" "$C_0"
+  printf '%s│%s  %snerval%s · vault  v%s%*s%s│%s\n' "$C_D" "$C_0" "$C_W" "$C_0" "$NERVAL_VERSION" "$pad" "" "$C_D" "$C_0"
+  printf '%s╰──────────────────────────────╯%s\n' "$C_D" "$C_0"
+}
+
+usage() {
+  header
+  cat <<EOF
+
+Pemakaian: nerval [perintah]
+Tiap akun punya username unik + password + vault sendiri. Login cukup sekali:
+Anda tetap masuk di akun yang sama (di folder/sesi Termux mana pun, juga setelah
+HP restart) sampai menjalankan "nerval logout". Perintah berikutnya tidak meminta
+password lagi. passwd, hapus-akun, hapus-semua tetap minta password.
+
+  daftar               Buat akun baru (+ cadangan pertama) dan langsung login
+  login [--ttl MENIT]  Login & simpan sesi PERMANEN (--ttl MENIT = batasi waktunya)
+  logout               Akhiri sesi & hentikan auto-backup
+  (kosong) | restore   Login, lalu pulihkan seluruh \$HOME dari vault akun
+           restore --keep   Pulihkan tanpa menimpa file yang sudah ada
+           restore --no-tools   Pulihkan tanpa menawarkan pasang ulang tools
+  backup               Cadangkan & kunci seluruh \$HOME ke vault akun
+           backup --force   Timpa vault lama walau \$HOME belum dipulihkan
+  hide                 Amankan \$HOME ke vault tersembunyi sekarang juga
+  tools                Pasang ulang tools (nano, python, dll.) dari daftar di vault
+           tools list      Lihat daftar tools yang tersimpan
+           tools skip      Abaikan daftar tools hasil restore
+  status               Status akun, auto-backup & vault
+  auto on|off          Hidupkan / matikan auto-backup
+  passwd               Ganti password akun
+  hapus-akun           Hapus akun ini beserta vault-nya
+  hapus-semua          Hapus SEMUA akun, vault, data & perintah nerval
+  reset                Hapus akun yang lupa password (tanpa login)
+  version | help       Versi / bantuan (tanpa login)
+
+File di \$HOME Anda tidak pernah dihapus oleh nerval.
+EOF
+}
+
+# ---------------------------------------------------------------------------
+# Akun & path
+# ---------------------------------------------------------------------------
+_acct_id() { printf 'nerval-acct:%s' "$1" | sha256sum | cut -c1-12; }
+
+_set_paths() {   # dari ACCT
+  if [ "$ACCT" = "$DEFAULT_ACCT" ]; then
+    ACCT_ID="0x8f9"
+  else
+    ACCT_ID=$(_acct_id "$ACCT")
+  fi
+  VAULT_FILE="$VAULT_DIR/.sys_cache_${ACCT_ID}.bin"
+  SYNC_MARK="$STATE_DIR/synced_${ACCT_ID}"
+}
+
+_count_vaults() {
+  local n=0 f
+  for f in "$VAULT_DIR"/.sys_cache_*.bin; do [ -f "$f" ] && n=$((n + 1)); done
+  echo "$n"
+}
+_any_vault() { [ "$(_count_vaults)" -gt 0 ]; }
+
+_valid_user() { [[ "$1" =~ ^[a-z0-9_.-]{3,24}$ ]]; }
+
+# Tanya username → ACCT (+ path). $1=nodef untuk tidak menampilkan default.
+_ask_username() {
+  local def="" n=""
+  if [ "${1:-}" != "nodef" ] && [ -f "$LAST_USER_FILE" ]; then
+    def=$(cat "$LAST_USER_FILE" 2>/dev/null)
+    _valid_user "$def" || def=""
+  fi
+  if [ -t 0 ]; then
+    IFS= read -r -p "Username${def:+ [$def]}: " n || { echo >&2; return 1; }
+  else
+    IFS= read -r n || return 1
+  fi
+  [ -n "$n" ] || n="$def"
+  n=$(printf '%s' "$n" | tr 'A-Z' 'a-z')
+  if ! _valid_user "$n"; then
+    err "Username tidak valid (3–24 karakter: huruf, angka, _ . -)."
+    return 1
+  fi
+  ACCT="$n"; _set_paths
+  return 0
+}
+
+_confirm() {   # $1 = kata yang harus diketik
+  local c=""
+  if [ -t 0 ]; then IFS= read -r -p "Ketik $1 untuk melanjutkan: " c || c=""
+  else IFS= read -r c || c=""; fi
+  [ "$c" = "$1" ]
+}
+
+# ---------------------------------------------------------------------------
+# Kripto — format file: [16 byte salt][16 byte IV][ciphertext AES-256-CBC]
+# ---------------------------------------------------------------------------
+_salt_hex() { od -An -v -tx1 -N16 "$1" | tr -d ' \n'; }
+_iv_hex()   { od -An -v -tx1 -j16 -N16 "$1" | tr -d ' \n'; }
+_hex2bin()  { printf "$(printf '%s' "$1" | sed 's/../\\x&/g')"; }
+
+# derive_key <password> <salt_hex>  →  cetak kunci 256-bit (64 hex)
+derive_key() {
+  local ph k
+  ph=$(printf '%s' "$1" | od -An -v -tx1 | tr -d ' \n')
+  [ -n "$ph" ] || return 1
+  k=$(openssl kdf -keylen 32 -binary \
+        -kdfopt digest:SHA256 -kdfopt "hexpass:$ph" \
+        -kdfopt "hexsalt:$2" -kdfopt "iter:$KDF_ITER" PBKDF2 2>/dev/null \
+      | od -An -v -tx1 | tr -d ' \n')
+  [ "${#k}" -eq 64 ] || return 1
+  printf '%s' "$k"
+}
+
+# _probe_key <file> <key> : 0 bila blok pertama terdekripsi menjadi gzip
+_probe_key() {
+  local f="$1" k="$2" iv magic
+  iv=$(_iv_hex "$f")
+  magic=$(tail -c +"$HDR_SKIP" "$f" 2>/dev/null | head -c 16 \
+    | openssl enc -d -aes-256-cbc -nopad -K "$k" -iv "$iv" 2>/dev/null \
+    | od -An -v -tx1 -N2 | tr -d ' \n')
+  [ "$magic" = "1f8b" ]
+}
+
+_check_tools() {
+  if ! command -v openssl >/dev/null 2>&1; then
+    err "Perintah 'openssl' tidak ada. Jalankan: pkg install openssl-tool"
+    return 1
+  fi
+  if ! openssl kdf -keylen 8 -kdfopt digest:SHA256 -kdfopt pass:a -kdfopt salt:b \
+         -kdfopt iter:1000 PBKDF2 >/dev/null 2>&1; then
+    err "openssl Anda belum mendukung PBKDF2. Jalankan: pkg upgrade openssl-tool"
+    return 1
+  fi
+  command -v tar >/dev/null 2>&1 || { err "Perintah 'tar' tidak ada. Jalankan: pkg install tar"; return 1; }
+  command -v sha256sum >/dev/null 2>&1 || { err "Perintah 'sha256sum' tidak ada. Jalankan: pkg install coreutils"; return 1; }
+  return 0
+}
+
+# ---------------------------------------------------------------------------
+# Password & login
+# ---------------------------------------------------------------------------
+_read_secret() {   # $1=prompt ; hasil di REPLY_PW
+  local p=""
+  if [ -t 0 ]; then
+    IFS= read -r -s -p "$1" p || { echo >&2; return 1; }
+    echo >&2
+  else
+    IFS= read -r p || return 1
+  fi
+  REPLY_PW="$p"
+  return 0
+}
+
+_read_new_password() {   # hasil di NEW_PW
+  local p1 p2
+  while :; do
+    _read_secret "Buat password baru (min. 8 karakter): " || return 1
+    p1="$REPLY_PW"; REPLY_PW=""
+    if [ "${#p1}" -lt 8 ]; then
+      err "Password terlalu pendek (minimal 8 karakter)."
+      [ -t 0 ] || return 1
+      continue
+    fi
+    _read_secret "Ulangi password: " || return 1
+    p2="$REPLY_PW"; REPLY_PW=""
+    if [ "$p1" = "$p2" ]; then NEW_PW="$p1"; return 0; fi
+    err "Password tidak sama."
+    [ -t 0 ] || return 1
+  done
+}
+
+_storage_ok() { [ -d /sdcard ] && ls /sdcard >/dev/null 2>&1; }
+
+_need_storage() {
+  if ! _storage_ok; then
+    err "Penyimpanan /sdcard belum bisa diakses."
+    info "Jalankan: termux-setup-storage  lalu izinkan akses, kemudian ulangi."
+    return 1
+  fi
+  return 0
+}
+
+# ---------------------------------------------------------------------------
+# Sesi login — login sekali, tidak perlu password terus-menerus.
+# File sesi berisi kunci turunan (bukan password), chmod 600, di folder privat
+# Termux (~/.nerval), tidak ikut backup. Berlaku sampai: waktu habis, logout,
+# HP/Termux restart, atau password akun diganti/dihapus.
+# ---------------------------------------------------------------------------
+_sess_get() { grep -m1 "^$1=" "$SESSION_FILE" 2>/dev/null | cut -d= -f2-; }
+_session_clear() { rm -f "$SESSION_FILE" "$SESSION_FILE".*; }
+_session_peek() { local a; a=$(_sess_get acct); _valid_user "$a" && printf '%s' "$a"; }
+
+_session_write() {   # $1=akun $2=kunci $3=ttl(menit) [$4=start]
+  local now tmp; now=$(date +%s)
+  mkdir -p "$STATE_DIR" || return 1
+  chmod 700 "$STATE_DIR" 2>/dev/null
+  tmp="$SESSION_FILE.$$"
+  (
+    umask 077
+    {
+      printf 'acct=%s\n' "$1"
+      printf 'key=%s\n' "$2"
+      printf 'boot=%s\n' "$BOOT_ID"
+      printf 'ttl=%s\n' "$3"
+      printf 'start=%s\n' "${4:-$now}"
+      printf 'last=%s\n' "$now"
+    } > "$tmp"
+  ) && mv -f "$tmp" "$SESSION_FILE"
+}
+
+# Simpan ulang sesi untuk ACCT/KEY saat ini (mis. setelah ganti password), TTL dipertahankan.
+_session_save() {
+  local tt; tt=$(_sess_get ttl)
+  [[ "$tt" =~ ^[0-9]+$ ]] || tt="$DEFAULT_TTL"
+  _session_write "$ACCT" "$KEY" "$tt"
+}
+
+# Muat sesi yang masih berlaku → ACCT, KEY terisi. Gagal → SESSION_NOTE berisi alasan.
+_session_load() {
+  local a k b ttl last now st
+  SESSION_NOTE=""
+  [ -f "$SESSION_FILE" ] || return 1
+  a=$(_sess_get acct); k=$(_sess_get key); b=$(_sess_get boot)
+  ttl=$(_sess_get ttl); last=$(_sess_get last); st=$(_sess_get start)
+  if ! _valid_user "$a" || ! [[ "$k" =~ ^[0-9a-f]{64}$ ]] \
+     || ! [[ "$ttl" =~ ^[0-9]+$ ]] || ! [[ "$last" =~ ^[0-9]+$ ]]; then
+    _session_clear; return 1
+  fi
+  # (sesi sengaja TIDAK berakhir saat HP/Termux restart: permanen sampai "nerval logout")
+  now=$(date +%s)
+  if [ "$ttl" -gt 0 ] && [ $(( now - last )) -gt $(( ttl * 60 )) ]; then
+    _session_clear; SESSION_NOTE="waktu sesi habis"; return 1
+  fi
+  ACCT="$a"; _set_paths
+  if [ ! -f "$VAULT_FILE" ] || ! _probe_key "$VAULT_FILE" "$k"; then
+    _session_clear; ACCT=""; ACCT_ID=""; VAULT_FILE=""; SYNC_MARK=""
+    SESSION_NOTE="akun/password berubah"; return 1
+  fi
+  KEY="$k"
+  _session_write "$a" "$k" "$ttl" "$st"
+  return 0
+}
+
+_session_text() {
+  local ttl last now rem
+  [ -f "$SESSION_FILE" ] || { echo "tidak ada"; return; }
+  ttl=$(_sess_get ttl); last=$(_sess_get last); now=$(date +%s)
+  if [ "$ttl" = "0" ]; then echo "permanen (sampai Anda menjalankan: nerval logout)"; return; fi
+  [[ "$ttl" =~ ^[0-9]+$ ]] && [[ "$last" =~ ^[0-9]+$ ]] || { echo "tidak valid"; return; }
+  rem=$(( ttl * 60 - (now - last) )); [ "$rem" -lt 0 ] && rem=0
+  printf '%s j %s mnt tersisa (diperpanjang tiap dipakai)' "$(( rem / 3600 ))" "$(( (rem % 3600) / 60 ))"
+}
+
+do_login_info() {
+  ok "Sesi tersimpan: $(_session_text)"
+  info "Anda tetap masuk di akun ini, juga setelah HP restart, sampai Anda menjalankan: nerval logout"
+  return 0
+}
+
+do_logout() {
+  if [ -f "$SESSION_FILE" ]; then
+    _session_clear
+    _stop_watcher
+    ok "Keluar. Sesi dihapus dan auto-backup dihentikan."
+  else
+    info "Tidak ada sesi aktif."
+  fi
+  return 0
+}
+
+# Login. $1 = session (pakai sesi bila ada, bawaan) | reauth (wajib password, untuk
+# perintah sensitif) | fresh (login baru). $2 = TTL sesi dalam menit (opsional).
+_login() {
+  local mode="${1:-session}" want_ttl="${2:-}" salt k tries=0 peek=""
+  _need_storage || return 1
+  if ! _any_vault; then
+    err "Belum ada akun."
+    info "Buat akun dengan: nerval daftar"
+    return 1
+  fi
+  if [ "$mode" = session ]; then
+    if _session_load; then
+      ok "OK — masuk sebagai $ACCT (sesi aktif)"
+      return 0
+    fi
+    [ -n "$SESSION_NOTE" ] && info "Sesi berakhir ($SESSION_NOTE) — login ulang."
+  fi
+  if [ "$mode" = reauth ]; then
+    peek=$(_session_peek)
+    if [ -n "$peek" ]; then
+      ACCT="$peek"; _set_paths
+      info "Konfirmasi password untuk akun '$ACCT'."
+    fi
+  fi
+  if [ -z "$peek" ]; then _ask_username || return 1; fi
+  if [ ! -f "$VAULT_FILE" ]; then
+    err "Akun '$ACCT' tidak ditemukan."
+    info "Buat akun dengan: nerval daftar"
+    return 1
+  fi
+  salt=$(_salt_hex "$VAULT_FILE")
+  if [ "${#salt}" -ne 32 ]; then err "Vault rusak (header tidak valid)."; return 1; fi
+  if [ -z "$want_ttl" ] && [ "$mode" = reauth ]; then want_ttl=$(_sess_get ttl); fi
+  [[ "$want_ttl" =~ ^[0-9]+$ ]] || want_ttl="$DEFAULT_TTL"
+  while [ "$tries" -lt 3 ]; do
+    _read_secret "Tulis password anda: " || return 1
+    k=$(derive_key "$REPLY_PW" "$salt"); REPLY_PW=""
+    if [ -n "$k" ] && _probe_key "$VAULT_FILE" "$k"; then
+      KEY="$k"
+      mkdir -p "$STATE_DIR"; printf '%s' "$ACCT" > "$LAST_USER_FILE"
+      _session_write "$ACCT" "$KEY" "$want_ttl"
+      ok "OK — masuk sebagai $ACCT"
+      return 0
+    fi
+    tries=$((tries + 1))
+    err "Password salah."
+    sleep 1
+  done
+  err "Terlalu banyak percobaan."
+  return 1
+}
+
+# ---------------------------------------------------------------------------
+# Utilitas vault, lock, log
+# ---------------------------------------------------------------------------
+_ensure_vault() {
+  _need_storage || return 1
+  mkdir -p "$VAULT_DIR" "$STATE_DIR" 2>/dev/null || { err "Gagal membuat vault di $VAULT_DIR"; return 1; }
+  [ -f "$VAULT_DIR/.nomedia" ] || : > "$VAULT_DIR/.nomedia" 2>/dev/null
+  return 0
+}
+
+_space_check() {
+  local avail
+  avail=$(df -Pk /sdcard 2>/dev/null | awk 'NR==2{print $4}')
+  case "$avail" in ''|*[!0-9]*) return 0 ;; esac
+  if [ "$avail" -lt 51200 ]; then
+    err "Ruang penyimpanan kurang (tersisa < 50 MB)."
+    return 1
+  fi
+}
+
+_lock() {
+  mkdir -p "$STATE_DIR"
+  if mkdir "$LOCK_DIR" 2>/dev/null; then echo $$ > "$LOCK_DIR/pid"; return 0; fi
+  local p; p=$(cat "$LOCK_DIR/pid" 2>/dev/null)
+  if [ -n "$p" ] && kill -0 "$p" 2>/dev/null; then return 1; fi
+  rm -rf "$LOCK_DIR"
+  if mkdir "$LOCK_DIR" 2>/dev/null; then echo $$ > "$LOCK_DIR/pid"; return 0; fi
+  return 1
+}
+_unlock() {
+  [ "$(cat "$LOCK_DIR/pid" 2>/dev/null)" = "$$" ] && rm -rf "$LOCK_DIR"
+  return 0
+}
+
+_log_trim() {
+  [ -f "$LOG_FILE" ] || return 0
+  local sz; sz=$(stat -c %s "$LOG_FILE" 2>/dev/null || echo 0)
+  if [ "$sz" -gt 102400 ]; then
+    tail -n 200 "$LOG_FILE" > "$LOG_FILE.t" 2>/dev/null && mv -f "$LOG_FILE.t" "$LOG_FILE"
+  fi
+}
+
+# ---------------------------------------------------------------------------
+# Daftar tools (paket Termux, pip, npm) — ikut tersimpan terenkripsi di vault
+# Yang disimpan hanya DAFTAR-nya; program dipasang ulang dari repositori.
+# ---------------------------------------------------------------------------
+_sort() { LC_ALL=C sort -u; }
+_count_lines() { local c; c=$(grep -c . "$1" 2>/dev/null); echo "${c:-0}"; }
+
+_pkg_names() { dpkg-query -W -f='${Package}\n' 2>/dev/null | _sort; }
+_pkg_manual() {
+  local out=""
+  if command -v apt-mark >/dev/null 2>&1; then out=$(apt-mark showmanual 2>/dev/null | _sort); fi
+  [ -n "$out" ] || out=$(_pkg_names)
+  printf '%s\n' "$out" | sed '/^$/d'
+}
+_pip_names() {
+  command -v pip >/dev/null 2>&1 || return 0
+  pip list --format=freeze 2>/dev/null | cut -d= -f1 | tr 'A-Z_' 'a-z-' | _sort
+}
+_npm_names() {
+  command -v npm >/dev/null 2>&1 || return 0
+  npm ls -g --depth=0 --parseable 2>/dev/null | tail -n +2 | sed 's#.*/node_modules/##' | _sort
+}
+
+# Susun $STATE_DIR/manifest (dimasukkan ke arsip). $1 = umur maks. sebelum dibuat ulang.
+_manifest_build() {
+  local age="${1:-0}" d="$STATE_DIR/manifest" prev="$HOME/$MANIFEST_NAME" now mt
+  mkdir -p "$STATE_DIR" || return 1
+  now=$(date +%s)
+
+  # Daftar hasil restore yang belum dipasang ulang: dibawa terus, jangan ditimpa
+  # (supaya tools yang belum terpasang tidak hilang dari cadangan).
+  if [ -f "$prev/PENDING" ]; then
+    rm -rf "$d"; mkdir -p "$d" || return 1
+    cp -a "$prev/." "$d/" 2>/dev/null
+    rm -f "$d/PENDING"
+    return 0
+  fi
+
+  if [ "$age" -gt 0 ] && [ -f "$d/meta.txt" ]; then
+    mt=$(stat -c %Y "$d/meta.txt" 2>/dev/null || echo 0)
+    [ $(( now - mt )) -lt "$age" ] && return 0
+  fi
+
+  rm -rf "$d"; mkdir -p "$d" || return 1
+  _pkg_manual > "$d/pkg.txt"
+  dpkg-query -W -f='${Package} ${Version}\n' 2>/dev/null | LC_ALL=C sort > "$d/pkg-versions.txt"
+  if command -v pip >/dev/null 2>&1; then
+    pip list --format=freeze 2>/dev/null | grep -viE '^(pip|setuptools|wheel)==' | _sort > "$d/pip.txt"
+  else
+    : > "$d/pip.txt"
+  fi
+  _npm_names | grep -vx npm > "$d/npm.txt"
+  {
+    printf 'nerval=%s\n' "$NERVAL_VERSION"
+    printf 'date=%s\n' "$(date '+%F %T')"
+    printf 'arch=%s\n' "$(uname -m)"
+    printf 'pkg=%s\n' "$(_count_lines "$d/pkg.txt")"
+  } > "$d/meta.txt"
+  return 0
+}
+
+# Cetak path direktori daftar tools: salinan di $HOME, atau diekstrak dari vault.
+_manifest_dir() {
+  local d="$HOME/$MANIFEST_NAME" t="$STATE_DIR/manifest-vault" iv_hex
+  if [ -f "$d/meta.txt" ]; then printf '%s' "$d"; return 0; fi
+  rm -rf "$t"; mkdir -p "$t" || return 1
+  iv_hex=$(_iv_hex "$VAULT_FILE")
+  tail -c +"$HDR_SKIP" "$VAULT_FILE" \
+    | openssl enc -d -aes-256-cbc -K "$KEY" -iv "$iv_hex" 2>/dev/null \
+    | tar -xzf - -C "$t" "$MANIFEST_NAME" 2>/dev/null
+  [ -f "$t/$MANIFEST_NAME/meta.txt" ] || return 1
+  printf '%s' "$t/$MANIFEST_NAME"
+}
+
+_missing_pkg() {   # $1 = dir manifest
+  [ -s "$1/pkg.txt" ] || return 0
+  LC_ALL=C comm -23 <(_sort < "$1/pkg.txt") <(_pkg_names)
+}
+_missing_pip() {
+  local spec name have
+  [ -s "$1/pip.txt" ] || return 0
+  have=$(_pip_names)
+  while IFS= read -r spec; do
+    [ -n "$spec" ] || continue
+    name=$(printf '%s' "${spec%%=*}" | tr 'A-Z_' 'a-z-')
+    printf '%s\n' "$have" | grep -qxF -- "$name" || printf '%s\n' "$spec"
+  done < "$1/pip.txt"
+}
+_missing_npm() {
+  [ -s "$1/npm.txt" ] || return 0
+  LC_ALL=C comm -23 <(_sort < "$1/npm.txt") <(_npm_names)
+}
+
+_tools_check_arch() {
+  local a; a=$(grep '^arch=' "$1/meta.txt" 2>/dev/null | cut -d= -f2)
+  if [ -n "$a" ] && [ "$a" != "$(uname -m)" ]; then
+    warn "Arsitektur berbeda (cadangan: $a, perangkat ini: $(uname -m)). Tools dipasang ulang dari repositori; versi mengikuti repositori saat ini."
+  fi
+  return 0
+}
+
+_tools_install() {   # $1 = dir manifest
+  local d="$1" miss p spec name
+  local -a bad=()
+
+  miss=$(_missing_pkg "$d")
+  if [ -n "$miss" ]; then
+    if command -v pkg >/dev/null 2>&1; then
+      info "Memasang $(printf '%s\n' "$miss" | wc -l | tr -d ' ') paket Termux ..."
+      # shellcheck disable=SC2086
+      if ! pkg install -y $miss; then
+        for p in $miss; do
+          dpkg -s "$p" >/dev/null 2>&1 && continue
+          pkg install -y "$p" >/dev/null 2>&1 || bad+=("pkg:$p")
+        done
+      fi
+    else
+      bad+=("pkg: perintah 'pkg' tidak ada")
+    fi
+  fi
+
+  miss=$(_missing_pip "$d")
+  if [ -n "$miss" ]; then
+    if command -v pip >/dev/null 2>&1; then
+      info "Memasang $(printf '%s\n' "$miss" | wc -l | tr -d ' ') paket pip ..."
+      while IFS= read -r spec; do
+        [ -n "$spec" ] || continue
+        name="${spec%%=*}"
+        pip install -q "$spec" >/dev/null 2>&1 || pip install -q "$name" >/dev/null 2>&1 || bad+=("pip:$name")
+      done <<< "$miss"
+    else
+      bad+=("pip: python/pip belum terpasang")
+    fi
+  fi
+
+  miss=$(_missing_npm "$d")
+  if [ -n "$miss" ]; then
+    if command -v npm >/dev/null 2>&1; then
+      info "Memasang $(printf '%s\n' "$miss" | wc -l | tr -d ' ') paket npm ..."
+      while IFS= read -r p; do
+        [ -n "$p" ] || continue
+        npm install -g "$p" >/dev/null 2>&1 || bad+=("npm:$p")
+      done <<< "$miss"
+    else
+      bad+=("npm: nodejs belum terpasang")
+    fi
+  fi
+
+  if [ "${#bad[@]}" -eq 0 ]; then
+    rm -f "$HOME/$MANIFEST_NAME/PENDING"
+    ok "Semua tools berhasil dipasang ulang."
+    return 0
+  fi
+  warn "Beberapa tools gagal dipasang:"
+  printf '    - %s\n' "${bad[@]}" >&2
+  info "Periksa koneksi internet, lalu ulangi: nerval tools"
+  return 1
+}
+
+_tools_list() {
+  local d="$1"
+  printf '%sDaftar tools tersimpan%s\n' "$C_W" "$C_0"
+  [ -f "$d/meta.txt" ] && sed 's/^/  /' "$d/meta.txt"
+  printf '\n  Paket Termux (%s):\n' "$(_count_lines "$d/pkg.txt")"
+  [ -s "$d/pkg.txt" ] && tr '\n' ' ' < "$d/pkg.txt" | fold -s -w 68 | sed 's/^/    /'
+  printf '\n  pip (%s): %s\n' "$(_count_lines "$d/pip.txt")" "$(tr '\n' ' ' < "$d/pip.txt" 2>/dev/null)"
+  printf '  npm (%s): %s\n' "$(_count_lines "$d/npm.txt")" "$(tr '\n' ' ' < "$d/npm.txt" 2>/dev/null)"
+}
+
+_after_restore_tools() {   # $1 = 1 jika --no-tools
+  local skip="${1:-0}" d="$HOME/$MANIFEST_NAME" mp mpip mnpm total ans="" names
+  [ -f "$d/meta.txt" ] || return 0
+  : > "$d/PENDING"
+  mp=$(_missing_pkg "$d" | wc -l | tr -d ' ')
+  mpip=$(_missing_pip "$d" | wc -l | tr -d ' ')
+  mnpm=$(_missing_npm "$d" | wc -l | tr -d ' ')
+  total=$(( mp + mpip + mnpm ))
+  if [ "$total" -eq 0 ]; then
+    rm -f "$d/PENDING"
+    info "Semua tools yang tersimpan sudah terpasang."
+    return 0
+  fi
+  _tools_check_arch "$d"
+  names=$(_missing_pkg "$d" | head -n 6 | tr '\n' ' ')
+  info "Tools yang belum terpasang: $mp paket Termux, $mpip pip, $mnpm npm."
+  [ -n "$names" ] && info "Contoh: $names"
+  if [ "$skip" -eq 1 ] || [ ! -t 0 ]; then
+    info "Pasang ulang kapan saja dengan: nerval tools"
+    return 0
+  fi
+  IFS= read -r -p "Pasang ulang sekarang? (butuh internet) [Y/n] " ans || ans="n"
+  case "${ans:-y}" in
+    n|N|t|T) info "Dilewati. Pasang ulang kapan saja dengan: nerval tools"; return 0 ;;
+  esac
+  _tools_install "$d"
+}
+
+do_tools() {
+  local sub="${1:-install}" d
+  case "$sub" in install|list|skip) ;; *) err "Pemakaian: nerval tools [list|skip]"; return 1 ;; esac
+  if ! d=$(_manifest_dir); then
+    warn "Cadangan akun ini belum menyimpan daftar tools."
+    info "Jalankan 'nerval backup' di sistem yang tools-nya sudah lengkap."
+    return 1
+  fi
+  case "$sub" in
+    list)    _tools_list "$d" ;;
+    skip)    rm -f "$HOME/$MANIFEST_NAME/PENDING"
+             ok "Daftar tools diabaikan. Cadangan berikutnya menyimpan daftar tools saat ini." ;;
+    install) _tools_check_arch "$d"; _tools_install "$d" ;;
+  esac
+}
+
+# ---------------------------------------------------------------------------
+# Backup
+# ---------------------------------------------------------------------------
+_do_backup_inner() {
+  local tmp salt_hex iv_hex st
+  tmp="$VAULT_DIR/.tmp_$$.part"
+
+  if [ -f "$VAULT_FILE" ]; then salt_hex=$(_salt_hex "$VAULT_FILE"); else salt_hex="$SALT_HEX"; fi
+  if [ -z "$KEY" ] || [ "${#salt_hex}" -ne 32 ]; then
+    err "Kunci belum dibuka atau vault rusak."
+    return 1
+  fi
+
+  { _hex2bin "$salt_hex" > "$tmp" && openssl rand 16 >> "$tmp" 2>/dev/null; } \
+    || { err "Gagal menulis ke vault."; rm -f "$tmp"; return 1; }
+  iv_hex=$(_iv_hex "$tmp")
+
+  _manifest_build "$MANIFEST_AGE" || warn "Daftar tools gagal dibuat (cadangan tetap berjalan)."
+  mkdir -p "$STATE_DIR/manifest"
+  info "Mengarsipkan & mengunci \$HOME + daftar tools ..."
+  tar -C "$HOME" \
+      --exclude='./storage' --exclude='./.cache' --exclude='./.nerval' \
+      --exclude="./$MANIFEST_NAME" \
+      --transform "s,^manifest,$MANIFEST_NAME," \
+      -czf - . -C "$STATE_DIR" manifest 2>>"$LOG_FILE" \
+    | openssl enc -aes-256-cbc -K "$KEY" -iv "$iv_hex" >> "$tmp" 2>>"$LOG_FILE"
+  st=("${PIPESTATUS[@]}")
+  # tar: 0 = ok, 1 = ada file berubah saat dibaca (masih diterima)
+  if [ "${st[0]}" -gt 1 ] || [ "${st[1]}" -ne 0 ]; then
+    err "Proses arsip/enkripsi gagal (lihat $LOG_FILE)."
+    rm -f "$tmp"; return 1
+  fi
+
+  # Verifikasi penuh sebelum menggantikan cadangan lama
+  if ! _probe_key "$tmp" "$KEY" \
+     || ! tail -c +"$HDR_SKIP" "$tmp" | openssl enc -d -aes-256-cbc -K "$KEY" -iv "$iv_hex" 2>/dev/null \
+          | tar -tzf - >/dev/null 2>&1; then
+    err "Verifikasi gagal: arsip tidak valid. Cadangan lama dibiarkan utuh."
+    rm -f "$tmp"; return 1
+  fi
+
+  mv -f "$tmp" "$VAULT_FILE" || { err "Gagal memindahkan ke vault."; rm -f "$tmp"; return 1; }
+  [ -f "$VAULT_DIR/.nomedia" ] || : > "$VAULT_DIR/.nomedia"
+  : > "$SYNC_MARK"
+  ok "Cadangan tersimpan di vault ($(du -h "$VAULT_FILE" 2>/dev/null | cut -f1))."
+  return 0
+}
+
+do_backup() {
+  local force=0 rc
+  [ "${1:-}" = "--force" ] && force=1
+  _ensure_vault || return 1
+
+  if [ -f "$VAULT_FILE" ] && [ ! -f "$SYNC_MARK" ] && [ "$force" -ne 1 ]; then
+    warn "Vault akun ini berisi cadangan lama, tetapi \$HOME ini belum dipulihkan."
+    info "Jalankan 'nerval' untuk memulihkan dulu, atau 'nerval backup --force' untuk menimpa."
+    return 3
+  fi
+
+  _space_check || return 1
+  if ! _lock; then warn "Backup lain sedang berjalan."; return 2; fi
+  _do_backup_inner; rc=$?
+  rm -f "$VAULT_DIR"/.tmp_$$.part 2>/dev/null
+  _unlock
+  return $rc
+}
+
+do_hide() {
+  do_backup "$@"; local rc=$?
+  if [ $rc -eq 0 ]; then
+    ok "Data \$HOME aman di vault tersembunyi (tidak terlihat di galeri/File Manager)."
+    info "File asli di \$HOME tidak dihapus."
+  fi
+  return $rc
+}
+
+# ---------------------------------------------------------------------------
+# Daftar akun baru
+# ---------------------------------------------------------------------------
+do_daftar() {
+  local rc
+  _need_storage || return 1
+  info "Buat akun baru."
+  _ask_username nodef || return 1
+  if [ -f "$VAULT_FILE" ]; then
+    err "Username '$ACCT' sudah dipakai (nama akun harus unik, huruf besar/kecil dianggap sama)."
+    info "Pilih username lain, atau login ke akun itu dengan: nerval login"
+    return 1
+  fi
+  warn "Password TIDAK bisa dipulihkan. Jika lupa, vault akun ini tidak bisa dibuka."
+  _read_new_password || return 1
+  SALT_HEX=$(openssl rand -hex 16 2>/dev/null)
+  KEY=$(derive_key "$NEW_PW" "$SALT_HEX"); NEW_PW=""
+  if [ -z "$KEY" ] || [ "${#SALT_HEX}" -ne 32 ]; then err "Gagal membuat kunci."; return 1; fi
+
+  do_backup; rc=$?
+  if [ $rc -ne 0 ] || [ ! -f "$VAULT_FILE" ]; then
+    err "Akun '$ACCT' gagal dibuat."
+    KEY=""
+    return 1
+  fi
+  mkdir -p "$STATE_DIR"; printf '%s' "$ACCT" > "$LAST_USER_FILE"
+  _session_write "$ACCT" "$KEY" "$DEFAULT_TTL"
+  ok "Akun '$ACCT' berhasil dibuat dan Anda sudah masuk."
+  _start_watcher
+  return 0
+}
+
+# ---------------------------------------------------------------------------
+# Restore
+# ---------------------------------------------------------------------------
+do_restore() {
+  local keep=0 notools=0 iv_hex st a
+  for a in "$@"; do
+    case "$a" in
+      --keep)     keep=1 ;;
+      --no-tools) notools=1 ;;
+    esac
+  done
+
+  if ! _lock; then warn "Proses lain sedang berjalan."; return 2; fi
+  mkdir -p "$STATE_DIR"
+  iv_hex=$(_iv_hex "$VAULT_FILE")
+  local -a opts=(-xzpf - -C "$HOME" --no-same-owner)
+  [ "$keep" -eq 1 ] && opts+=(--skip-old-files)
+
+  info "Memulihkan \$HOME ..."
+  tail -c +"$HDR_SKIP" "$VAULT_FILE" \
+    | openssl enc -d -aes-256-cbc -K "$KEY" -iv "$iv_hex" 2>/dev/null \
+    | tar "${opts[@]}" 2>>"$LOG_FILE"
+  st=("${PIPESTATUS[@]}")
+  _unlock
+
+  if [ "${st[1]}" -ne 0 ] || [ "${st[2]}" -ne 0 ]; then
+    err "Pemulihan gagal atau tidak lengkap (lihat $LOG_FILE)."
+    return 1
+  fi
+  : > "$SYNC_MARK"
+  ok "Seluruh data \$HOME berhasil dipulihkan."
+  info "Buka sesi Termux baru atau jalankan: source ~/.bashrc"
+  _after_restore_tools "$notools"
+  return 0
+}
+
+# ---------------------------------------------------------------------------
+# Ganti password
+# ---------------------------------------------------------------------------
+do_passwd() {
+  local nsalt nkey tmp iv_old iv_new st
+  _ensure_vault || return 1
+  info "Ganti password akun '$ACCT'."
+  _read_new_password || return 1
+  nsalt=$(openssl rand -hex 16 2>/dev/null)
+  nkey=$(derive_key "$NEW_PW" "$nsalt"); NEW_PW=""
+  if [ -z "$nkey" ] || [ "${#nsalt}" -ne 32 ]; then err "Gagal membuat kunci baru."; return 1; fi
+  if ! _lock; then warn "Proses lain sedang berjalan."; return 2; fi
+
+  tmp="$VAULT_DIR/.tmp_$$.part"
+  { _hex2bin "$nsalt" > "$tmp" && openssl rand 16 >> "$tmp" 2>/dev/null; } \
+    || { err "Gagal menulis ke vault."; rm -f "$tmp"; _unlock; return 1; }
+  iv_old=$(_iv_hex "$VAULT_FILE"); iv_new=$(_iv_hex "$tmp")
+
+  tail -c +"$HDR_SKIP" "$VAULT_FILE" \
+    | openssl enc -d -aes-256-cbc -K "$KEY" -iv "$iv_old" 2>/dev/null \
+    | openssl enc -aes-256-cbc -K "$nkey" -iv "$iv_new" >> "$tmp" 2>/dev/null
+  st=("${PIPESTATUS[@]}")
+  if [ "${st[0]}" -ne 0 ] || [ "${st[1]}" -ne 0 ] || [ "${st[2]}" -ne 0 ]; then
+    err "Gagal mengenkripsi ulang. Password lama tetap berlaku."
+    rm -f "$tmp"; _unlock; return 1
+  fi
+  if ! _probe_key "$tmp" "$nkey" \
+     || ! tail -c +"$HDR_SKIP" "$tmp" | openssl enc -d -aes-256-cbc -K "$nkey" -iv "$iv_new" 2>/dev/null \
+          | tar -tzf - >/dev/null 2>&1; then
+    err "Verifikasi gagal. Password lama tetap berlaku."
+    rm -f "$tmp"; _unlock; return 1
+  fi
+  mv -f "$tmp" "$VAULT_FILE" || { err "Gagal memindahkan ke vault."; rm -f "$tmp"; _unlock; return 1; }
+  KEY="$nkey"
+  _unlock
+  _session_save
+
+  _stop_watcher; sleep 1; _start_watcher
+  ok "Password berhasil diganti."
+  return 0
+}
+
+# ---------------------------------------------------------------------------
+# Hapus akun / reset / hapus semua  (TIDAK pernah menyentuh file di $HOME)
+# ---------------------------------------------------------------------------
+_remove_account() {
+  [ -n "$VAULT_FILE" ] || return 1
+  if [ "$(cat "$WATCH_ACCT_FILE" 2>/dev/null)" = "$ACCT_ID" ]; then _stop_watcher; fi
+  rm -f -- "$VAULT_FILE" "$SYNC_MARK"
+  rm -f -- "$VAULT_DIR"/.tmp_*.part 2>/dev/null
+  if [ "$(cat "$LAST_USER_FILE" 2>/dev/null)" = "$ACCT" ]; then rm -f "$LAST_USER_FILE"; fi
+  if [ "$(_sess_get acct)" = "$ACCT" ]; then _session_clear; fi
+  KEY=""
+  return 0
+}
+
+do_delete_account() {
+  warn "Ini MENGHAPUS akun '$ACCT' beserta vault-nya (cadangan \$HOME milik akun ini)."
+  info "File di \$HOME Anda TIDAK dihapus. Akun lain tidak terpengaruh."
+  if ! _confirm "$ACCT"; then info "Dibatalkan."; return 1; fi
+  _remove_account
+  ok "Akun '$ACCT' dan vault-nya dihapus."
+  return 0
+}
+
+do_reset() {
+  header
+  _need_storage || return 1
+  if ! _any_vault; then warn "Belum ada akun."; return 0; fi
+  _ask_username || return 1
+  if [ ! -f "$VAULT_FILE" ]; then err "Akun '$ACCT' tidak ditemukan."; return 1; fi
+  warn "Ini MENGHAPUS akun '$ACCT' beserta vault-nya TANPA password. Cadangannya hilang selamanya."
+  info "File di \$HOME Anda TIDAK dihapus."
+  if ! _confirm "HAPUS"; then info "Dibatalkan."; return 1; fi
+  _remove_account
+  ok "Akun '$ACCT' dihapus. Buat akun baru dengan: nerval daftar"
+  return 0
+}
+
+do_wipe_all() {
+  local n; n=$(_count_vaults)
+  warn "Ini MENGHAPUS SEMUA tentang nerval:"
+  printf '    - %s akun beserta semua vault di %s\n' "$n" "$VAULT_DIR" >&2
+  printf '    - data & log nerval (%s)\n' "$STATE_DIR" >&2
+  printf '    - daftar tools tersimpan (%s)\n' "$HOME/$MANIFEST_NAME" >&2
+  printf '    - pengingat di ~/.bashrc dan perintah nerval\n' >&2
+  info "File di \$HOME Anda TIDAK dihapus. Tindakan ini tidak bisa dibatalkan."
+  if ! _confirm "HAPUS SEMUA"; then info "Dibatalkan."; return 1; fi
+
+  _stop_watcher
+  [ "$VAULT_DIR" = "/sdcard/.sys_neban_vault" ] && rm -rf -- "$VAULT_DIR"
+  [ -f "$HOME/.bashrc" ] && sed -i '/# >>> nerval auto-sync >>>/,/# <<< nerval auto-sync <<</d' "$HOME/.bashrc"
+  rm -rf -- "$STATE_DIR" "$HOME/$MANIFEST_NAME"
+  rm -f -- "$PREFIX/bin/nerval"
+  KEY=""
+  ok "Semua akun, vault, data, dan perintah nerval telah dihapus."
+  info "Jika Anda membuat alias sendiri di ~/.bashrc (mis. nb, nr), hapus manual."
+  return 0
+}
+
+# ---------------------------------------------------------------------------
+# Watcher auto-sync (inotifywait + debounce). Kunci hanya ada di memori proses.
+# ---------------------------------------------------------------------------
+_watcher_alive() {
+  local p; p=$(cat "$PID_FILE" 2>/dev/null) || return 1
+  [ -n "$p" ] || return 1
+  kill -0 "$p" 2>/dev/null || return 1
+  tr '\0' ' ' < "/proc/$p/cmdline" 2>/dev/null | grep -q 'nerval'
+}
+
+_stop_watcher() {
+  local p; p=$(cat "$PID_FILE" 2>/dev/null)
+  [ -n "$p" ] && kill "$p" 2>/dev/null
+  rm -f "$PID_FILE" "$WATCH_ACCT_FILE"
+  return 0
+}
+
+_start_watcher() {
+  [ -f "$AUTO_OFF" ] && return 0
+  [ -n "$KEY" ] && [ -n "$VAULT_FILE" ] && [ -f "$VAULT_FILE" ] || return 0
+  command -v inotifywait >/dev/null 2>&1 || return 0
+  _storage_ok || return 0
+  if _watcher_alive; then
+    [ "$(cat "$WATCH_ACCT_FILE" 2>/dev/null)" = "$ACCT_ID" ] && return 0
+    _stop_watcher; sleep 1      # watcher milik akun lain → ganti ke akun ini
+  fi
+  mkdir -p "$STATE_DIR"
+  printf '%s' "$ACCT_ID" > "$WATCH_ACCT_FILE"
+  NERVAL_KEY="$KEY" NERVAL_ACCT="$ACCT" nohup "${BASH:-bash}" "$SELF" _watch >>"$LOG_FILE" 2>&1 &
+  disown 2>/dev/null || true
+  return 0
+}
+
+_watch_backup() {
+  _log_trim
+  printf '[%s] auto-backup dimulai (akun %s)\n' "$(date '+%F %T')" "$ACCT"
+  do_backup; local rc=$?
+  printf '[%s] auto-backup selesai (kode %s)\n' "$(date '+%F %T')" "$rc"
+}
+
+_watch_cleanup() {
+  [ -n "${INW:-}" ] && kill "$INW" 2>/dev/null
+  if [ "$(cat "$PID_FILE" 2>/dev/null)" = "$$" ]; then rm -f "$PID_FILE" "$WATCH_ACCT_FILE"; fi
+  return 0
+}
+
+_watch() {
+  command -v inotifywait >/dev/null 2>&1 || { echo "inotifywait tidak ditemukan"; exit 1; }
+  [ -n "$KEY" ] || { echo "kunci tidak tersedia"; exit 1; }
+  _valid_user "$ACCT" || { echo "akun tidak valid"; exit 1; }
+  _set_paths
+  mkdir -p "$STATE_DIR"
+  if _watcher_alive && [ "$(cat "$PID_FILE" 2>/dev/null)" != "$$" ]; then exit 0; fi
+  echo $$ > "$PID_FILE"
+  trap '_watch_cleanup' EXIT
+  trap 'exit 0' TERM INT HUP
+
+  printf '[%s] watcher aktif (PID %s, akun %s)\n' "$(date '+%F %T')" "$$" "$ACCT"
+
+  local exc="^${HOME}/(\\.cache|storage|\\.nerval)(/|\$)"
+  exec 3< <(inotifywait -m -r -q \
+              -e close_write,create,delete,moved_to,moved_from \
+              --exclude "$exc" --format '%w%f' "$HOME" 2>/dev/null)
+  INW=$!
+
+  local start
+  while IFS= read -r -u 3 _; do
+    start=$SECONDS
+    # Debounce: tunggu hingga $DEBOUNCE detik tanpa perubahan baru
+    while IFS= read -r -t "$DEBOUNCE" -u 3 _; do
+      [ $(( SECONDS - start )) -ge "$MAX_WAIT" ] && break
+    done
+    [ -f "$AUTO_OFF" ] && continue
+    [ -f "$VAULT_FILE" ] || continue   # akun dihapus → berhenti mencadangkan
+    _watch_backup
+  done
+}
+
+_hint() {
+  _any_vault || return 0
+  [ -f "$AUTO_OFF" ] && return 0
+  _watcher_alive && return 0
+  # Masih login (sesi permanen) → nyalakan lagi auto-backup diam-diam tanpa password.
+  if _session_load; then _start_watcher; return 0; fi
+  printf '%snerval%s: belum login — ketik %snerval login%s untuk mengaktifkan auto-backup.\n' \
+    "$C_W" "$C_0" "$C_W" "$C_0"
+}
+
+do_auto() {
+  case "${1:-}" in
+    on)
+      rm -f "$AUTO_OFF"
+      _start_watcher; sleep 1
+      if _watcher_alive; then ok "Auto-backup aktif."
+      else warn "Auto-backup belum berjalan (cek inotify-tools, akses /sdcard, dan vault)."; fi
+      ;;
+    off)
+      mkdir -p "$STATE_DIR"; : > "$AUTO_OFF"
+      _stop_watcher
+      ok "Auto-backup dimatikan."
+      ;;
+    *) err "Pemakaian: nerval auto on|off"; return 1 ;;
+  esac
+}
+
+# ---------------------------------------------------------------------------
+# Status
+# ---------------------------------------------------------------------------
+do_status() {
+  local n; n=$(_count_vaults)
+  echo
+  if _storage_ok; then ok "Akses penyimpanan  : aktif"; else warn "Akses penyimpanan  : belum aktif (termux-setup-storage)"; fi
+
+  if [ -f "$AUTO_OFF" ]; then
+    warn "Auto-backup        : dimatikan (nerval auto on)"
+  elif _watcher_alive; then
+    ok "Auto-backup        : aktif (PID $(cat "$PID_FILE"), jeda ${DEBOUNCE}s)"
+  else
+    warn "Auto-backup        : tidak berjalan (login dengan 'nerval status' / 'nerval auto on')"
+  fi
+
+  if [ "$n" -eq 0 ] || [ -z "$ACCT" ]; then
+    warn "Akun               : belum ada (jalankan: nerval daftar)"
+  else
+    local mt; mt=$(stat -c %Y "$VAULT_FILE" 2>/dev/null)
+    ok "Akun aktif         : $ACCT  (total akun: $n)"
+    [ -f "$SESSION_FILE" ] && ok "Sesi               : $(_session_text)"
+    ok "Vault              : ada ($(du -h "$VAULT_FILE" 2>/dev/null | cut -f1))"
+    ok "Cadangan terakhir  : $(date -d "@$mt" '+%d %b %Y %H:%M:%S' 2>/dev/null || echo '-')"
+    ok "Enkripsi           : password (PBKDF2-SHA256, ${KDF_ITER} iterasi, AES-256)"
+    if [ -f "$HOME/$MANIFEST_NAME/PENDING" ]; then
+      warn "Tools              : belum dipasang ulang — jalankan 'nerval tools'"
+    elif [ -f "$STATE_DIR/manifest/meta.txt" ]; then
+      ok "Tools tersimpan    : $(_count_lines "$STATE_DIR/manifest/pkg.txt") paket, $(_count_lines "$STATE_DIR/manifest/pip.txt") pip, $(_count_lines "$STATE_DIR/manifest/npm.txt") npm"
+    else
+      info "Tools              : daftar dibuat saat backup berikutnya"
+    fi
+    if [ -f "$SYNC_MARK" ]; then ok "Sinkron \$HOME      : ya"
+    else warn "Sinkron \$HOME      : belum — jalankan 'nerval' untuk memulihkan"; fi
+  fi
+  printf '%s  Lokasi: %s%s\n' "$C_D" "$VAULT_DIR" "$C_0"
+}
+
+# ---------------------------------------------------------------------------
+# Dispatcher
+# ---------------------------------------------------------------------------
+cmd="${1:-restore}"
+[ $# -gt 0 ] && shift
+
+case "$cmd" in
+  help|-h|--help)       usage; exit 0 ;;
+  version|-v|--version) echo "nerval v$NERVAL_VERSION"; exit 0 ;;
+  _ensure_watcher)      exit 0 ;;   # kompatibilitas blok ~/.bashrc lama
+  _hint)                _hint; exit 0 ;;
+  _watch)               KEY="${NERVAL_KEY:-}"; ACCT="${NERVAL_ACCT:-}"; unset NERVAL_KEY NERVAL_ACCT
+                        MANIFEST_AGE=3600; _watch; exit $? ;;
+  daftar|register)      _check_tools || exit 1; header; do_daftar; exit $? ;;
+  reset)                do_reset; exit $? ;;
+  logout)               header; do_logout; exit $? ;;
+  login|restore|r|backup|b|hide|status|s|auto|passwd|tools|hapus-akun|delete-account|hapus-semua|wipe) ;;
+  *) err "Perintah tidak dikenal: $cmd"; usage; exit 1 ;;
+esac
+
+# status tanpa akun tidak perlu login
+if { [ "$cmd" = status ] || [ "$cmd" = s ]; } && ! _any_vault; then
+  header; do_status; exit 0
+fi
+
+_check_tools || exit 1
+header
+
+mode=session; ttl=""
+case "$cmd" in
+  login)
+    mode=fresh
+    if [ "${1:-}" = "--ttl" ]; then
+      ttl="${2:-}"
+      if ! [[ "$ttl" =~ ^[0-9]+$ ]] || [ "$ttl" -gt 10080 ]; then
+        err "Pemakaian: nerval login --ttl <menit 0-10080>  (0 = sampai logout/restart)"
+        exit 1
+      fi
+    fi
+    ;;
+  passwd|hapus-akun|delete-account|hapus-semua|wipe) mode=reauth ;;
+esac
+_login "$mode" "$ttl" || exit 1
+
+case "$cmd" in
+  restore|r)                    do_restore "$@" ;;
+  backup|b)                     do_backup "$@" ;;
+  hide)                         do_hide "$@" ;;
+  status|s)                     do_status ;;
+  auto)                         do_auto "${1:-}" ;;
+  passwd)                       do_passwd ;;
+  tools)                        do_tools "${1:-}" ;;
+  login)                        do_login_info ;;
+  hapus-akun|delete-account)    do_delete_account ;;
+  hapus-semua|wipe)             do_wipe_all ;;
+esac
+rc=$?
+
+case "$cmd" in
+  login|restore|r|backup|b|hide|status|s) _start_watcher ;;
+esac
+exit $rc
